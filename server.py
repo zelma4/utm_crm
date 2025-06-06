@@ -4,6 +4,7 @@ import json
 import requests
 from flask import Flask, request
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -25,71 +26,38 @@ TOKENS_PATH = os.getenv("TOKENS_PATH", "tokens.json")
 
 app = Flask(__name__)
 
+
 def read_tokens():
     """
-    Зчитує JSON‐файл tokens.json, який має структуру:
+    Зчитує JSON-файл tokens.json, який має структуру:
     {
-      "access_token": "xxx",
-      "refresh_token": "yyy"
+      "access_token": "довготривалий_токен"
     }
+    (Поля refresh_token тепер не використовуються.)
     """
     if not os.path.exists(TOKENS_PATH):
         print(f"❌ Файл {TOKENS_PATH} не знайдено")
         raise FileNotFoundError(f"{TOKENS_PATH} not found")
     with open(TOKENS_PATH, "r") as f:
-        return json.load(f)
+        data = json.load(f)
 
-
-def write_tokens(new_access, new_refresh):
-    """
-    Перезаписує токени у файл tokens.json.
-    """
-    data = {
-        "access_token":  new_access,
-        "refresh_token": new_refresh
-    }
-    with open(TOKENS_PATH, "w") as f:
-        json.dump(data, f, indent=2)
-
-
-def refresh_access_token():
-    """
-    Оновлює access_token через refresh_token.
-    Повертає новий access_token.
-    """
-    tokens = read_tokens()
-    payload = {
-        "client_id":     CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "grant_type":    "refresh_token",
-        "refresh_token": tokens["refresh_token"],
-        "redirect_uri":  REDIRECT_URI
-    }
-    url = f"{AMO_DOMAIN}/oauth2/access_token"
-    resp = requests.post(url, json=payload)
-    if resp.status_code != 200:
-        print(f"❌ Помилка при оновленні токена: {resp.status_code} {resp.text}")
-        raise Exception("Не вдалося оновити access_token")
-    data = resp.json()
-    new_access  = data["access_token"]
-    new_refresh = data["refresh_token"]
-    write_tokens(new_access, new_refresh)
-    print("✅ Access token успішно оновлено")
-    return new_access
+    access = data.get("access_token")
+    if not access:
+        raise KeyError("У tokens.json відсутнє поле access_token")
+    return access
 
 
 def find_lead_id_by_email_or_phone(email, phone, access_token):
     """
     Шукає контакт у Kommo за email чи phone, та повертає перший lead_id, якщо він є.
     Якщо повернувся 204 → означає “контакт/лід ще не створені” – повертаємо (None, 204).
-    Якщо 401 → токен протух.
-    Якщо інший ≠200 і ≠204 → помилка.
+    Якщо 401 → токен невалідний → повертаємо (None, 401).
+    Якщо інший ≠200 і ≠204 → помилка (повертаємо (None, status_code)).
     """
     url = f"{AMO_DOMAIN}/api/v4/contacts"
     headers = {
         "Authorization": f"Bearer {access_token}"
     }
-    # Якщо є email – шукаємо по email, інакше – по телефону
     query_str = email if email else phone
     params = {
         "query": query_str,
@@ -111,23 +79,20 @@ def find_lead_id_by_email_or_phone(email, phone, access_token):
     data = resp.json()
     contacts = data.get("_embedded", {}).get("contacts", [])
     if not contacts:
-        # Хоча статус 200, але масив контактів порожній → лід поки що не створено
         return None, 204
 
     first = contacts[0]
     leads = first.get("_embedded", {}).get("leads", [])
     if not leads:
-        # Контакт є, але лід ще не створено
         return None, 204
 
-    # Повертаємо ID першого ліда
     return leads[0]["id"], 200
 
 
 def update_lead_utms(lead_id, hidden_fields, access_token):
     """
     Оновлює кастомні UTM-поля для ліда.
-    Повертає (True, статус) або (False, статус).
+    Повертає (True, status_code) або (False, status_code).
     """
     # Невелика затримка перед фактичним PATCH, щоб точно лід “відобразився”
     time.sleep(1)
@@ -149,6 +114,7 @@ def update_lead_utms(lead_id, hidden_fields, access_token):
     resp = requests.patch(url, json=payload, headers=headers)
 
     if resp.status_code == 401:
+        # токен недійсний (може бути відкликаний) → повертаємо, щоб можна було зрозуміти причину
         return False, 401
 
     if resp.status_code not in (200, 204):
@@ -166,6 +132,7 @@ def webhook_typeform():
       - form_response.hidden  (утм‐поля)
       - form_response.answers (email та/або phone_number)
     Далі чекаємо (max 10 спроб по 2 секунди), поки Kommo створить лід → patch UTM.
+    (Без жодного refresh_token: використовуємо лише довготривалий access_token.)
     """
     try:
         payload = request.get_json(force=True)
@@ -191,43 +158,39 @@ def webhook_typeform():
     if not email and not phone:
         return "❌ Не знайдено ні email, ні phone", 400
 
-    # Зчитаємо поточний access_token
-    tokens = read_tokens()
-    access_token = tokens.get("access_token")
+    # Зчитаємо access_token (long-lived) з файлу
+    try:
+        access_token = read_tokens()
+    except Exception as e:
+        print(f"❌ Помилка читання токена: {e}")
+        return f"❌ Не знайдено або невірний access_token: {e}", 500
 
-    # ▪ Polling: чекатимемо, поки Kommo створить контакт + лід (до 10 спроб, кожна з 2-секундною паузою)
+    # ▪ Polling: чекатимемо, поки Kommo створить контакт + лід (до 10 спроб, 2 с кожна)
     lead_id = None
     for attempt in range(10):
         lead_id, status_code = find_lead_id_by_email_or_phone(email, phone, access_token)
 
         if status_code == 401:
-            # токен протух – оновимо й одразу продовжимо спроби з новим токеном
-            access_token = refresh_access_token()
-            continue
+            # access_token недійсний (можливо, відкликаний) – повертаємо 401
+            return "❌ Access token недійсний або відкликаний", 401
 
         if status_code not in (200, 204):
-            # будь‐яка інша помилка – повернемо 500 Internal Server Error
             return f"❌ Помилка пошуку контакту/ліда: {status_code}", 500
 
         if lead_id:
-            # знайшли lead_id – можемо вийти з циклу
             break
 
-        # якщо status_code == 204 → лід ще не створено, робимо паузу перед наступною спробою
+        # якщо status_code == 204 → лід ще не створено, чекаємо
         time.sleep(2)
 
     if not lead_id:
-        # Після 10 спроб нічого не знайшли
         return "❌ Лід не знайдено після очікування", 404
 
     # ▪ Оновити знайдений лід, додаємо UTM
     success, upd_status = update_lead_utms(lead_id, hidden, access_token)
-    if not success and upd_status == 401:
-        # access_token протух під час PATCH → оновлюємо токен і повторюємо оновлення
-        access_token = refresh_access_token()
-        success, upd_status = update_lead_utms(lead_id, hidden, access_token)
-
     if not success:
+        if upd_status == 401:
+            return "❌ Access token недійсний під час оновлення ліда", 401
         return f"❌ Не вдалося оновити ліда (status={upd_status})", 500
 
     return "✅ Lead успішно оновлено", 200
